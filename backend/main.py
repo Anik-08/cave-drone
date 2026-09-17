@@ -1,22 +1,42 @@
-import serial
 import json
 import asyncio
+import base64
+import io
+import os
+from functools import lru_cache
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+try:
+    import serial
+except ImportError:
+    serial = None
+
+from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
 
-arduino = serial.Serial(
-    port="COM7",
-    baudrate=9600,
-    timeout=1
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
+
+MODEL_PATH = os.path.join(os.path.dirname(__file__), "fasterrcnn_person_best.pth")
+
+try:
+    arduino = serial.Serial(port="COM7", baudrate=9600, timeout=1) if serial else None
+except Exception as error:
+    arduino = None
+    print(f"Arduino unavailable; sensor WebSocket will remain idle: {error}")
 
 # Give Arduino time to reset after opening COM port
 print("Opening Arduino...")
-asyncio.sleep(0)
 
 def read_sensor_data():
+
+    if arduino is None:
+        return None
 
     while True:
 
@@ -69,6 +89,67 @@ def home():
     }
 
 
+@lru_cache(maxsize=1)
+def get_person_model():
+    """Load the supplied detector once, on the first image request."""
+    import torch
+    from torchvision.models.detection import fasterrcnn_mobilenet_v3_large_fpn
+    from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = fasterrcnn_mobilenet_v3_large_fpn(weights=None, weights_backbone=None)
+    features = model.roi_heads.box_predictor.cls_score.in_features
+    model.roi_heads.box_predictor = FastRCNNPredictor(features, 2)
+    state = torch.load(MODEL_PATH, map_location=device)
+    if isinstance(state, dict) and "model_state_dict" in state:
+        state = state["model_state_dict"]
+    model.load_state_dict(state)
+    model.to(device).eval()
+    return model, device
+
+
+@app.post("/api/detect-person")
+async def detect_person(image: UploadFile = File(...), threshold: float = 0.5):
+    if not image.content_type or not image.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Please upload a valid image file.")
+    if not 0.05 <= threshold <= 0.99:
+        raise HTTPException(status_code=400, detail="Threshold must be between 0.05 and 0.99.")
+
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+        import torch
+        from torchvision.transforms import ToTensor
+
+        raw = await image.read()
+        pil_image = Image.open(io.BytesIO(raw)).convert("RGB")
+        model, device = await asyncio.to_thread(get_person_model)
+        tensor = ToTensor()(pil_image).to(device)
+        with torch.no_grad():
+            prediction = model([tensor])[0]
+
+        detections = []
+        draw = ImageDraw.Draw(pil_image)
+        for box, score, label in zip(prediction["boxes"], prediction["scores"], prediction["labels"]):
+            if float(score) < threshold or int(label) != 1:
+                continue
+            x1, y1, x2, y2 = [round(value, 1) for value in box.cpu().tolist()]
+            confidence = round(float(score), 4)
+            detections.append({"box": [x1, y1, x2, y2], "confidence": confidence, "label": "person"})
+            draw.rectangle((x1, y1, x2, y2), outline="#38bdf8", width=max(3, pil_image.width // 300))
+            draw.text((x1 + 6, max(4, y1 - 24)), f"PERSON  {confidence:.0%}", fill="#38bdf8")
+
+        output = io.BytesIO()
+        pil_image.save(output, format="JPEG", quality=92)
+        return {
+            "present": bool(detections),
+            "count": len(detections),
+            "detections": detections,
+            "image": "data:image/jpeg;base64," + base64.b64encode(output.getvalue()).decode("ascii"),
+        }
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=f"Inference failed: {error}") from error
+
+
 @app.websocket("/ws/sensors")
 async def sensor_websocket(websocket: WebSocket):
 
@@ -82,9 +163,11 @@ async def sensor_websocket(websocket: WebSocket):
 
             data = await asyncio.to_thread(read_sensor_data)
 
-            print("SENDING:", data)
-
-            await websocket.send_json(data)
+            if data is not None:
+                print("SENDING:", data)
+                await websocket.send_json(data)
+            else:
+                await asyncio.sleep(2)
 
     except WebSocketDisconnect:
 
