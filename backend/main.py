@@ -3,6 +3,7 @@ import asyncio
 import base64
 import io
 import os
+import tempfile
 from functools import lru_cache
 
 try:
@@ -26,7 +27,87 @@ MODEL_PATH = os.path.join(os.path.dirname(__file__), "fasterrcnn_person_best.pth
 DCE_MODEL_PATH = os.path.join(os.path.dirname(__file__), "dce_model.keras")
 ENHANCE_IMAGE_SIZE = 256
 DARKNESS_THRESHOLD = 50
+VIDEO_SAMPLE_INTERVAL_SECONDS = 1.0
+MAX_VIDEO_FRAMES = 30
+VIDEO_OUTPUT_MAX_WIDTH = 480
 
+@app.post("/api/analyze-video")
+async def analyze_video_pipeline(video: UploadFile = File(...), threshold: float = 0.5):
+    if not video.content_type or not video.content_type.startswith("video/"):
+        raise HTTPException(status_code=400, detail="Please upload a valid video file.")
+    if not 0.05 <= threshold <= 0.99:
+        raise HTTPException(status_code=400, detail="Threshold must be between 0.05 and 0.99.")
+
+    tmp_path = None
+    try:
+        import cv2
+        from PIL import Image
+
+        raw = await video.read()
+        suffix = os.path.splitext(video.filename or "")[1] or ".mp4"
+        fd, tmp_path = tempfile.mkstemp(suffix=suffix)
+        with os.fdopen(fd, "wb") as f:
+            f.write(raw)
+
+        capture = cv2.VideoCapture(tmp_path)
+        fps = capture.get(cv2.CAP_PROP_FPS) or 25.0
+        total_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        duration = total_frames / fps if fps else 0.0
+        frame_step = max(1, round(fps * VIDEO_SAMPLE_INTERVAL_SECONDS))
+
+        results = []
+        frame_index = 0
+        processed = 0
+
+        while processed < MAX_VIDEO_FRAMES and frame_index < total_frames:
+            capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+            success, frame_bgr = capture.read()
+            if not success:
+                break
+
+            pil_frame = Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+
+            brightness = compute_brightness(pil_frame)
+            was_dark = brightness < DARKNESS_THRESHOLD
+
+            working_frame = await run_enhancement(pil_frame) if was_dark else pil_frame
+            detection_summary, annotated = await run_detection(working_frame, threshold)
+
+            if annotated.width > VIDEO_OUTPUT_MAX_WIDTH:
+                ratio = VIDEO_OUTPUT_MAX_WIDTH / annotated.width
+                annotated = annotated.resize((VIDEO_OUTPUT_MAX_WIDTH, round(annotated.height * ratio)))
+
+            buf = io.BytesIO()
+            annotated.save(buf, format="JPEG", quality=80)
+            image_b64 = "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+
+            results.append({
+                "timestamp": round(frame_index / fps, 2) if fps else None,
+                "brightness": round(brightness, 1),
+                "was_dark": was_dark,
+                "detection": {**detection_summary, "image": image_b64},
+            })
+
+            processed += 1
+            frame_index += frame_step
+
+        capture.release()
+
+        return {
+            "duration_seconds": round(duration, 2),
+            "fps": round(fps, 2),
+            "frames_processed": processed,
+            "any_person_detected": any(r["detection"]["present"] for r in results),
+            "total_detections": sum(r["detection"]["count"] for r in results),
+            "frames": results,
+        }
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=f"Video analysis failed: {error}") from error
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 def compute_brightness(pil_image):
     import numpy as np
