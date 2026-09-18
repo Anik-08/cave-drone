@@ -23,6 +23,51 @@ app.add_middleware(
 )
 
 MODEL_PATH = os.path.join(os.path.dirname(__file__), "fasterrcnn_person_best.pth")
+DCE_MODEL_PATH = os.path.join(os.path.dirname(__file__), "dce_model.keras")
+ENHANCE_IMAGE_SIZE = 256
+
+@lru_cache(maxsize=1)
+def get_enhance_model():
+    """Load the low-light enhancement (DCE) model once, on first request."""
+    from tensorflow import keras
+    return keras.models.load_model(DCE_MODEL_PATH)
+
+@app.post("/api/enhance-image")
+async def enhance_image_endpoint(image: UploadFile = File(...)):
+    if not image.content_type or not image.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Please upload a valid image file.")
+
+    try:
+        import numpy as np
+        import tensorflow as tf
+        from PIL import Image
+
+        raw = await image.read()
+        original = Image.open(io.BytesIO(raw)).convert("RGB")
+        resized = original.resize((ENHANCE_IMAGE_SIZE, ENHANCE_IMAGE_SIZE))
+
+        arr = np.array(resized).astype("float32") / 255.0
+        arr = np.expand_dims(arr, axis=0)
+
+        model = await asyncio.to_thread(get_enhance_model)
+        dce_output = await asyncio.to_thread(model, arr, training=False)
+
+        x = arr
+        for i in range(0, 3 * 8, 3):
+            r = dce_output[:, :, :, i:i + 3]
+            x = x + r * (tf.square(x) - x)
+
+        enhanced = tf.clip_by_value(x[0], 0.0, 1.0)
+        enhanced = tf.cast(enhanced * 255, tf.uint8).numpy()
+        enhanced_image = Image.fromarray(enhanced).resize(original.size)
+
+        output = io.BytesIO()
+        enhanced_image.save(output, format="JPEG", quality=92)
+        return {
+            "image": "data:image/jpeg;base64," + base64.b64encode(output.getvalue()).decode("ascii"),
+        }
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=f"Enhancement failed: {error}") from error
 
 try:
     arduino = serial.Serial(port="COM7", baudrate=9600, timeout=1) if serial else None
