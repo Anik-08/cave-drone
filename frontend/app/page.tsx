@@ -15,6 +15,7 @@ import SensorDetailsTable from "@/components/SensorDetailsTable";
 import ConcentrationPanel from "@/components/ConcentrationPanel";
 import PersonDetection from "@/components/PersonDetection";
 import ImageEnhancement from "@/components/ImageEnhancement";
+import CaveScan from "@/components/CaveScan";
 
 const SPARKLINE_POINTS = 48;
 
@@ -88,6 +89,7 @@ export default function DashboardPage() {
 
         <PersonDetection />
         <ImageEnhancement />
+        <CaveScan />
 
         <footer className="border-t border-edge pt-4 pb-2">
           <p className="font-mono text-[10px] uppercase tracking-wider text-faint">
