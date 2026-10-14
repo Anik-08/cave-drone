@@ -11,7 +11,10 @@ try:
 except ImportError:
     serial = None
 
-from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect, HTTPException
+import time
+from datetime import datetime
+
+from fastapi import FastAPI, File, Request, UploadFile, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
@@ -339,6 +342,168 @@ async def analyze_image_pipeline(image: UploadFile = File(...), threshold: float
         }
     except Exception as error:
         raise HTTPException(status_code=500, detail=f"Pipeline failed: {error}") from error
+
+
+
+# =====================================================================
+#  LIVE ESP32-CAM PIPELINE
+#  ESP32-CAM --(HTTP POST raw JPEG)--> /api/esp-upload
+#       -> queue -> brightness check -> (DCE enhance if dark) -> person detect
+#       -> broadcast over WebSocket /ws/camera -> dashboard (LiveCamera.tsx)
+# =====================================================================
+LIVE_THRESHOLD = 0.5          # detection confidence threshold for live frames
+LIVE_QUEUE_SIZE = 4           # max frames waiting; oldest is dropped when full
+SAVE_RAW_FRAMES = True        # keep a copy of every received frame in ./photos
+PHOTO_DIR = os.path.join(os.path.dirname(__file__), "photos")
+
+live_clients: set = set()
+live_queue = None             # created lazily inside the running event loop
+live_worker_task = None
+latest_live_result = None
+live_frame_counter = 0
+
+
+def to_data_url(pil_image, quality=85):
+    buf = io.BytesIO()
+    pil_image.save(buf, format="JPEG", quality=quality)
+    return "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+async def process_live_frame(item):
+    """brightness -> enhance (if dark) -> detect. Returns the JSON payload for the dashboard."""
+    from PIL import Image
+
+    started = time.perf_counter()
+    original = Image.open(io.BytesIO(item["raw"])).convert("RGB")
+
+    brightness = compute_brightness(original)
+    was_dark = brightness < DARKNESS_THRESHOLD
+
+    working = original
+    enhanced_b64 = None
+    if was_dark:
+        working = await run_enhancement(original)
+        enhanced_b64 = to_data_url(working)
+
+    summary, annotated = await run_detection(working, LIVE_THRESHOLD)
+
+    return {
+        "frame_id": item["frame_id"],
+        "received_at": item["received_at"],
+        "angle": item["angle"],
+        "brightness": round(brightness, 1),
+        "was_dark": was_dark,
+        "present": summary["present"],
+        "count": summary["count"],
+        "detections": summary["detections"],
+        "original": to_data_url(original, 75),
+        "enhanced": enhanced_b64,
+        "annotated": to_data_url(annotated, 85),
+        "process_ms": round((time.perf_counter() - started) * 1000),
+    }
+
+
+async def broadcast_live(payload):
+    dead = []
+    for client in list(live_clients):
+        try:
+            await client.send_json(payload)
+        except Exception:
+            dead.append(client)
+    for client in dead:
+        live_clients.discard(client)
+
+
+async def live_worker():
+    """Single worker so the CPU/GPU only runs one inference at a time."""
+    global latest_live_result
+    print("[LIVE] Loading models (first frame may take a few seconds)...")
+    try:
+        await asyncio.to_thread(get_person_model)
+    except Exception as error:
+        print(f"[LIVE] Person model failed to load: {error}")
+    print("[LIVE] Worker ready")
+
+    while True:
+        item = await live_queue.get()
+        try:
+            payload = await process_live_frame(item)
+            latest_live_result = payload
+            print(
+                f"[LIVE] frame #{payload['frame_id']} angle={payload['angle']} "
+                f"brightness={payload['brightness']} dark={payload['was_dark']} "
+                f"persons={payload['count']} ({payload['process_ms']} ms)"
+            )
+            await broadcast_live(payload)
+        except Exception as error:
+            print(f"[LIVE] Frame failed: {error}")
+
+
+def ensure_live_worker():
+    global live_queue, live_worker_task
+    if live_queue is None:
+        live_queue = asyncio.Queue(maxsize=LIVE_QUEUE_SIZE)
+    if live_worker_task is None or live_worker_task.done():
+        live_worker_task = asyncio.create_task(live_worker())
+
+
+@app.post("/api/esp-upload")
+async def esp_upload(request: Request):
+    """Receives a raw JPEG body from the ESP32-CAM (Content-Type: image/jpeg)."""
+    global live_frame_counter
+    raw = await request.body()
+    if len(raw) < 100 or raw[:2] != b"\xff\xd8":
+        raise HTTPException(status_code=400, detail="Body is not a valid JPEG.")
+
+    ensure_live_worker()
+    live_frame_counter += 1
+
+    if SAVE_RAW_FRAMES:
+        os.makedirs(PHOTO_DIR, exist_ok=True)
+        name = f"photo_{datetime.now():%Y%m%d_%H%M%S}_{live_frame_counter:04d}.jpg"
+        with open(os.path.join(PHOTO_DIR, name), "wb") as f:
+            f.write(raw)
+
+    item = {
+        "raw": raw,
+        "frame_id": live_frame_counter,
+        "received_at": int(time.time() * 1000),
+        "angle": request.headers.get("x-angle"),
+    }
+    if live_queue.full():
+        try:
+            live_queue.get_nowait()   # drop the oldest so the dashboard stays "live"
+        except asyncio.QueueEmpty:
+            pass
+    live_queue.put_nowait(item)
+
+    print(f"[LIVE] received frame #{item['frame_id']} ({len(raw)} bytes) from {request.client.host}")
+    return {"queued": True, "frame_id": item["frame_id"]}
+
+
+@app.get("/api/live/latest")
+def live_latest():
+    """Handy for debugging in the browser: http://localhost:8000/api/live/latest"""
+    return latest_live_result or {"message": "No frames received yet."}
+
+
+@app.websocket("/ws/camera")
+async def camera_websocket(websocket: WebSocket):
+    await websocket.accept()
+    live_clients.add(websocket)
+    print(f"[LIVE] dashboard connected ({len(live_clients)} client(s))")
+    try:
+        if latest_live_result is not None:
+            await websocket.send_json(latest_live_result)
+        while True:
+            await websocket.receive_text()   # keeps the socket open; detects disconnects
+    except WebSocketDisconnect:
+        pass
+    except Exception as error:
+        print("[LIVE] websocket error:", error)
+    finally:
+        live_clients.discard(websocket)
+        print(f"[LIVE] dashboard disconnected ({len(live_clients)} client(s))")
 
 
 @app.websocket("/ws/sensors")
