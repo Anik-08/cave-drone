@@ -703,11 +703,13 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from model_artifacts import assert_required_artifacts_ready
 
 @asynccontextmanager
 async def lifespan(_app):
     # Runs once when uvicorn starts: remember the event loop, start the live worker
     # and start the ESP32 receiver (port 5000) in a background thread.
+    assert_required_artifacts_ready()
     global main_loop
     main_loop = asyncio.get_running_loop()
     ensure_live_worker()
