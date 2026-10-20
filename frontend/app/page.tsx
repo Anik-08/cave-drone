@@ -17,6 +17,7 @@ import PersonDetection from "@/components/PersonDetection";
 import ImageEnhancement from "@/components/ImageEnhancement";
 import CaveScan from "@/components/CaveScan";
 import VideoScan from "@/components/VideoScan";
+import LiveCamera from "@/components/LiveCamera";
 
 const SPARKLINE_POINTS = 48;
 
@@ -87,6 +88,8 @@ export default function DashboardPage() {
           analysis={analysis}
           isStale={feed.isStale}
         />
+
+        <LiveCamera />
 
         <PersonDetection />
         <ImageEnhancement />
