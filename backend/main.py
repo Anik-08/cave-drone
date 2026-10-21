@@ -801,7 +801,9 @@ async def analyze_video_pipeline(video: UploadFile = File(...), threshold: float
             "duration_seconds": round(duration, 2),
             "fps": round(fps, 2),
             "frames_processed": processed,
-            "any_person_detected": any(r["detection"]["present"] for r in results),
+            "any_person_detected": any(r["detection"]["person_present"] for r in results),
+            "any_object_detected": any(r["detection"]["present"] for r in results),
+            "class_totals": _sum_counts(r["detection"]["counts"] for r in results),
             "total_detections": sum(r["detection"]["count"] for r in results),
             "frames": results,
         }
@@ -812,6 +814,13 @@ async def analyze_video_pipeline(video: UploadFile = File(...), threshold: float
     finally:
         if tmp_path and os.path.exists(tmp_path):
             os.remove(tmp_path)
+
+def _sum_counts(count_dicts):
+    totals = {}
+    for counts in count_dicts:
+        for label, n in counts.items():
+            totals[label] = totals.get(label, 0) + n
+    return totals
 
 def compute_brightness(pil_image):
     import numpy as np
@@ -981,11 +990,73 @@ def _run_detection_sync(pil_image, threshold):
     return {"present": bool(detections), "count": len(detections), "detections": detections}, annotated
 
 
+# ===== GENERAL OBJECT DETECTION (YOLO) =====
+YOLO_MODEL_PATH = os.path.join(os.path.dirname(__file__), "yolo11n.pt")
+_yolo_lock = threading.Lock()   # live worker and upload endpoints must not call YOLO at the same time
+_BOX_COLORS = ["#f59e0b", "#a78bfa", "#34d399", "#f87171", "#fb923c", "#22d3ee", "#e879f9", "#a3e635"]
+
+
+@lru_cache(maxsize=1)
+def get_object_model():
+    """Load YOLO once. Uses backend/yolo11n.pt if present, otherwise downloads it on first use."""
+    from ultralytics import YOLO
+
+    return YOLO(YOLO_MODEL_PATH if os.path.exists(YOLO_MODEL_PATH) else "yolo11n.pt")
+
+
+def _box_color(label):
+    return _BOX_COLORS[sum(ord(ch) for ch in label) % len(_BOX_COLORS)]
+
+
+def _run_combined_detection_sync(pil_image, threshold):
+    """People (Faster R-CNN) + every other COCO object (YOLO). Blocking: call via run_detection()."""
+    from PIL import ImageDraw
+
+    summary, annotated = _run_detection_sync(pil_image, threshold)   # your existing person detector
+    detections = list(summary["detections"])
+
+    try:
+        model = get_object_model()
+        with _yolo_lock:
+            result = model.predict(pil_image, conf=threshold, verbose=False)[0]
+
+        draw = ImageDraw.Draw(annotated)
+        names = result.names
+        boxes = result.boxes.xyxy.cpu().tolist()
+        scores = result.boxes.conf.cpu().tolist()
+        classes = result.boxes.cls.cpu().tolist()
+        for (x1, y1, x2, y2), score, cls in zip(boxes, scores, classes):
+            label = str(names[int(cls)])
+            if label == "person":          # handled by the fine-tuned Faster R-CNN
+                continue
+            x1, y1, x2, y2 = [round(v, 1) for v in (x1, y1, x2, y2)]
+            confidence = round(float(score), 4)
+            color = _box_color(label)
+            detections.append({"box": [x1, y1, x2, y2], "confidence": confidence, "label": label})
+            draw.rectangle((x1, y1, x2, y2), outline=color, width=max(3, annotated.width // 300))
+            draw.text((x1 + 6, max(4, y1 - 24)), f"{label.upper()}  {confidence:.0%}", fill=color)
+    except Exception as error:
+        print(f"[DETECT] YOLO object detection skipped: {error}")
+
+    counts = {}
+    for item in detections:
+        counts[item["label"]] = counts.get(item["label"], 0) + 1
+    person_count = counts.get("person", 0)
+
+    return {
+        "present": bool(detections),          # ANY object found
+        "count": len(detections),
+        "person_present": person_count > 0,   # people only (use this for safety alerts)
+        "person_count": person_count,
+        "counts": counts,                     # e.g. {"person": 1, "backpack": 2}
+        "detections": detections,
+    }, annotated
+
 async def run_detection(pil_image, threshold):
     """Plain helper — NOT an endpoint. Runs inference off the event loop so the server stays responsive."""
-    return await asyncio.to_thread(_run_detection_sync, pil_image, threshold)
+    return await asyncio.to_thread(_run_combined_detection_sync, pil_image, threshold)
 
-
+@app.post("/api/detect-objects")
 @app.post("/api/detect-person")
 async def detect_person(image: UploadFile = File(...), threshold: float = 0.5):
     if not image.content_type or not image.content_type.startswith("image/"):
@@ -1110,6 +1181,8 @@ async def process_live_frame(item):
         "was_dark": was_dark,
         "present": summary["present"],
         "count": summary["count"],
+        "person_present": summary["person_present"],
+        "counts": summary["counts"],
         "detections": summary["detections"],
         "original": await asyncio.to_thread(to_data_url, original, 70),
         "enhanced": enhanced_b64,
@@ -1137,6 +1210,11 @@ async def live_worker():
         await asyncio.to_thread(get_person_model)
     except Exception as error:
         print(f"[LIVE] Person model failed to load: {error}")
+
+    try:
+        await asyncio.to_thread(get_object_model)
+    except Exception as error:
+        print(f"[LIVE] YOLO object model failed to load: {error}")
     print("[LIVE] Worker ready")
 
     while True:
@@ -1147,7 +1225,7 @@ async def live_worker():
             print(
                 f"[LIVE] cycle {payload['cycle']} frame {payload['frame_index']} "
                 f"brightness={payload['brightness']} dark={payload['was_dark']} "
-                f"persons={payload['count']} ({payload['process_ms']} ms)"
+                f"objects={payload['count']} {payload['counts']} ({payload['process_ms']} ms)"
             )
             await broadcast_live(payload)
         except Exception as error:

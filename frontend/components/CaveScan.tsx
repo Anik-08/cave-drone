@@ -2,13 +2,14 @@
 
 import { useEffect, useRef, useState } from "react";
 import { CheckCircle2, ImagePlus, Loader2, ScanFace, Upload, XCircle } from "lucide-react";
+import { summarizeCounts } from "@/lib/objects";
 
 type Detection = { box: number[]; confidence: number; label: string };
 type PipelineResult = {
   brightness: number;
   was_dark: boolean;
   enhanced_image: string | null;
-  detection: { present: boolean; count: number; detections: Detection[]; image: string };
+  detection: { present: boolean; count: number; person_present: boolean; counts: Record<string, number>; detections: Detection[]; image: string };
 };
 
 type Stage = "idle" | "checking" | "enhancing" | "detecting" | "done";
@@ -61,7 +62,7 @@ export default function CaveScan() {
     idle: null,
     checking: "Checking image brightness...",
     enhancing: "Image is dark — enhancing...",
-    detecting: result?.was_dark ? "Image enhanced. Now detecting humans..." : "Image looks fine. Detecting humans...",
+    detecting: result?.was_dark ? "Image enhanced. Now detecting objects..." : "Image looks fine. Detecting objects...",
     done: null,
   };
 
@@ -139,7 +140,7 @@ export default function CaveScan() {
                     result.detection.present ? "text-emerald-300" : "text-dim"
                   }`}
                 >
-                  {result.detection.present ? "Human detected" : "No human detected"}
+                  {result.detection.present ? summarizeCounts(result.detection.counts) : "No objects detected"}
                 </p>
                 <p className="mt-2 font-mono text-[11px] text-faint">
                   {result.was_dark ? "Enhanced before detection" : "No enhancement needed"} · brightness{" "}

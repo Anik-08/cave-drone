@@ -2,19 +2,20 @@
 
 import { useRef, useState } from "react";
 import { AlertTriangle, CheckCircle2, Clapperboard, Loader2, Upload, XCircle } from "lucide-react";
+import { summarizeCounts } from "@/lib/objects";
 
 type FrameResult = {
   timestamp: number | null;
   brightness: number;
   was_dark: boolean;
-  detection: { present: boolean; count: number; detections: unknown[]; image: string };
+  detection: { present: boolean; count: number; person_present: boolean; counts: Record<string, number>; detections: unknown[]; image: string };
 };
 
 type VideoResult = {
   duration_seconds: number;
   fps: number;
   frames_processed: number;
-  any_person_detected: boolean;
+  any_person_detected: boolean; any_object_detected: boolean; class_totals: Record<string, number>;
   total_detections: number;
   frames: FrameResult[];
 };
@@ -62,7 +63,7 @@ export default function VideoScan() {
             </h2>
           </div>
           <p className="font-mono text-[11px] text-faint">
-            Upload footage — frames are sampled roughly once per second, enhanced if dark, and checked for people.
+            Upload footage — frames are sampled roughly once per second, enhanced if dark, and scanned for people and objects.
           </p>
         </div>
         <span className="rounded-sm border border-accent/25 bg-accent/10 px-2 py-1 font-mono text-[10px] uppercase tracking-wider text-accent">
@@ -114,22 +115,22 @@ export default function VideoScan() {
         <div className="mt-4">
           <div
             className={`mb-4 flex flex-wrap items-center gap-3 rounded-sm border px-3 py-2 ${
-              result.any_person_detected ? "border-emerald-300/30 bg-emerald-300/5" : "border-edge bg-panel-raised/30"
+              result.any_object_detected ? "border-emerald-300/30 bg-emerald-300/5" : "border-edge bg-panel-raised/30"
             }`}
           >
-            {result.any_person_detected ? (
+            {result.any_object_detected ? (
               <CheckCircle2 className="h-5 w-5 text-emerald-300" />
             ) : (
               <AlertTriangle className="h-5 w-5 text-faint" />
             )}
             <p
               className={`font-mono text-sm font-semibold uppercase tracking-wider ${
-                result.any_person_detected ? "text-emerald-300" : "text-dim"
+                result.any_object_detected ? "text-emerald-300" : "text-dim"
               }`}
             >
-              {result.any_person_detected
-                ? `Person detected in ${result.total_detections} sampled frame${result.total_detections === 1 ? "" : "s"}`
-                : "No person detected in sampled frames"}
+              {result.any_object_detected
+                ? `Detected: ${summarizeCounts(result.class_totals)}` 
+                : "No objects detected in sampled frames"}
             </p>
             <p className="ml-auto font-mono text-[10px] uppercase tracking-wider text-faint">
               {result.frames_processed} frames · {result.duration_seconds}s clip
@@ -148,7 +149,7 @@ export default function VideoScan() {
                 <div className="flex items-center justify-between px-2 py-1">
                   <span className="font-mono text-[10px] text-faint">{frame.timestamp}s</span>
                   {frame.detection.present ? (
-                    <span className="font-mono text-[10px] uppercase text-emerald-300">Person</span>
+                    <span className="font-mono text-[10px] uppercase text-emerald-300">{summarizeCounts(frame.detection.counts)}</span>
                   ) : (
                     <span className="font-mono text-[10px] uppercase text-faint">Clear</span>
                   )}
